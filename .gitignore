@@ -1,0 +1,11 @@
+gx_token.txt
+outlook_export/*
+teams_export/*
+path/
+path/*
+.DS_Store
+combined_search.html
+__pycache__/
+__pycache__/*
+*_old
+*.zip
