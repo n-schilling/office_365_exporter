@@ -50,6 +50,45 @@ python -m venv .venv
 python -m pip install msal requests
 ```
 
+### Windows — standalone (embeddable) Python, no install / no admin rights
+
+If you can't (or don't want to) install Python system-wide, use the official
+**Windows embeddable package** — a self-contained Python you just unzip. It has no
+`pip` by default, so there are a couple of extra steps.
+
+1. Download the **"Windows embeddable package (64-bit)"** from
+   [python.org/downloads/windows](https://www.python.org/downloads/windows/) and
+   unzip it, e.g. to `C:\python-standalone`.
+2. Enable `site-packages` so installed packages can be imported. In that folder,
+   open the file named like `python3XX._pth` (e.g. `python311._pth`) in a text
+   editor and **remove the `#` in front of** `import site`:
+
+   ```
+   import site
+   ```
+3. Bootstrap `pip` (run these in PowerShell from the unzipped folder):
+
+   ```powershell
+   cd C:\python-standalone
+   Invoke-WebRequest https://bootstrap.pypa.io/get-pip.py -OutFile get-pip.py
+   .\python.exe get-pip.py
+   ```
+4. Install the export packages:
+
+   ```powershell
+   .\python.exe -m pip install msal requests
+   ```
+
+From then on, call this Python by its full path (`C:\python-standalone\python.exe`)
+wherever the commands below say `python`, for example:
+
+```powershell
+C:\python-standalone\python.exe teams_export.py
+```
+
+> The embeddable package is self-contained, so a virtual environment isn't needed —
+> packages install into the standalone folder itself.
+
 In every following command, use `python3` on macOS/Linux and `python` on Windows.
 The example commands below show macOS/Linux first, then the Windows equivalent.
 
