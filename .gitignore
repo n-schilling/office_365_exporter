@@ -9,3 +9,5 @@ __pycache__/
 __pycache__/*
 *_old
 *.zip
+rag_store
+rag_store/*

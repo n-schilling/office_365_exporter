@@ -18,6 +18,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import requests
@@ -79,26 +80,41 @@ def build_index(teams_dir, outlook_dir, store, model, url, batch=64):
 
     old = load_old_vectors(store)
     vectors = [None] * len(chunks)
-    todo, todo_idx = [], []
+    # Pro eindeutigem Inhalts-Hash nur EINMAL einbetten und das Ergebnis auf alle
+    # gleichen Chunks verteilen (identische Signaturen/Disclaimer kommen oft vor).
+    uniq = {}                       # hash -> Liste der Chunk-Indizes mit diesem Hash
     for i, c in enumerate(chunks):
         v = old.get(c["hash"])
         if v is not None:
             vectors[i] = np.asarray(v, dtype="float32")
         else:
-            todo.append(c)
-            todo_idx.append(i)
+            uniq.setdefault(c["hash"], []).append(i)
 
-    print(f"{len(chunks)} Chunks: {len(chunks) - len(todo)} wiederverwendet, "
-          f"{len(todo)} neu einzubetten.")
-    if todo:
+    todo_groups = list(uniq.values())          # je eindeutiger Text: alle Zielindizes
+    todo_texts = [corpus.embed_text(chunks[idxs[0]]) for idxs in todo_groups]
+    new_total = sum(len(g) for g in todo_groups)
+    print(f"{len(chunks)} Chunks: {len(chunks) - new_total} wiederverwendet, "
+          f"{new_total} neu ({len(todo_texts)} eindeutig einzubetten).")
+
+    if todo_texts:
         done = 0
-        for b in range(0, len(todo), batch):
-            part = todo[b:b + batch]
-            vecs = embed([corpus.embed_text(c) for c in part], model, url)
-            for k, vec in enumerate(vecs):
-                vectors[todo_idx[b + k]] = np.asarray(vec, dtype="float32")
-            done += len(part)
-            print(f"  … {done}/{len(todo)} eingebettet", end="\r", flush=True)
+        # Embedding ist GPU-gebunden und serialisiert auf einem Slot; mit zwei
+        # Requests „in flight“ liegt immer schon einer in der Server-Queue, sodass
+        # die GPU zwischen den Batches nicht leerläuft (kein Idle-Bubble).
+        def run(b):
+            texts = todo_texts[b:b + batch]
+            return b, embed(texts, model, url)
+        starts = range(0, len(todo_texts), batch)
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            futs = {ex.submit(run, b): b for b in starts}
+            for fut in as_completed(futs):
+                b, vecs = fut.result()
+                for k, vec in enumerate(vecs):
+                    arr = np.asarray(vec, dtype="float32")
+                    for i in todo_groups[b + k]:
+                        vectors[i] = arr
+                done += len(vecs)
+                print(f"  … {done}/{len(todo_texts)} eingebettet", end="\r", flush=True)
         print()
 
     V = np.vstack(vectors).astype("float32")
@@ -113,7 +129,7 @@ def build_index(teams_dir, outlook_dir, store, model, url, batch=64):
     (sp / "info.json").write_text(json.dumps({
         "model": model, "dim": int(V.shape[1]), "chunks": len(chunks),
     }, ensure_ascii=False, indent=2), encoding="utf-8")
-    return len(chunks), len(todo), int(V.shape[1])
+    return len(chunks), new_total, int(V.shape[1])
 
 
 def main():

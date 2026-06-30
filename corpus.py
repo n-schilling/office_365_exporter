@@ -7,6 +7,7 @@ und zerlegt lange Texte in überlappende Chunks. Wird von rag_index.py (Embeddin
 und rag_server.py (Retrieval/Antwort) genutzt. Nur Standardbibliothek.
 """
 
+import os
 import re
 import email
 import html as html_lib
@@ -17,12 +18,34 @@ from email.utils import getaddresses
 from datetime import datetime, timezone
 from pathlib import Path
 from html.parser import HTMLParser
+from functools import partial
+from concurrent.futures import ProcessPoolExecutor
 
 CATS = {"1on1", "group", "meeting", "channels"}
 CAT_LABEL = {"1on1": "1:1-Chat", "group": "Gruppenchat",
              "meeting": "Besprechung", "channels": "Kanal"}
 _BLOCK = {"br", "p", "div", "li", "tr"}
 SAFETY_CAP = 500_000   # absurd lange Einzeltexte begrenzen (vor dem Chunking)
+
+# Ab wie vielen Dateien sich der Prozess-Pool lohnt (Spawn-Overhead amortisiert).
+_PAR_THRESHOLD = 200
+
+
+def _pmap(func, files, root_dir):
+    """func(p_str, root_str) über alle Dateien – parallel über alle CPU-Kerne.
+
+    Das Parsen der Exporte ist reine CPU-Arbeit und war bisher single-threaded
+    der langsamste Teil vor dem (GPU-gebundenen) Einbetten. Bei vielen Dateien
+    auf alle Kerne verteilen; bei wenigen seriell (Spawn lohnt nicht).
+    """
+    paths = [str(p) for p in files]
+    if len(paths) < _PAR_THRESHOLD:
+        return [func(p, root_dir) for p in paths]
+    workers = os.cpu_count() or 4
+    chunksize = max(1, len(paths) // (workers * 8))
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(partial(func, root_str=root_dir), paths,
+                           chunksize=chunksize))
 
 
 # --------------------------------------------------------------------------
@@ -111,31 +134,38 @@ def parse_local(s):
         return None
 
 
+def _teams_file(p_str, root_str):
+    p, root = Path(p_str), Path(root_str)
+    raw = p.read_text(encoding="utf-8", errors="replace")
+    pr = ConvParser()
+    try:
+        pr.feed(raw)
+        pr.finish()
+        title, msgs = pr.title, pr.msgs
+    except Exception:
+        title, msgs = p.stem.rsplit("__", 1)[0], []
+    rel = p.relative_to(root).as_posix()
+    top = rel.split("/")[0]
+    cat = top if top in CATS else "other"
+    ctx = f"Kanal: {title}" if cat == "channels" else CAT_LABEL.get(cat, "Teams")
+    out = []
+    for i, m in enumerate(msgs):
+        out.append({
+            "uid": f"teams:{rel}:{i}", "src": "teams", "root": "teams", "rel": rel,
+            "who": m["n"] or "(unbekannt)", "ppl": (m["n"] + " " + title).lower(),
+            "ts": parse_local(m["t"]), "date": m["t"], "title": title, "ctx": ctx,
+            "text": (m["x"] or "")[:SAFETY_CAP],
+        })
+    return out
+
+
 def load_teams(root_dir):
-    recs = []
     root = Path(root_dir)
     files = [p for p in sorted(root.rglob("*.html"))
              if p.name not in ("index.html", "search.html")]
-    for p in files:
-        raw = p.read_text(encoding="utf-8", errors="replace")
-        pr = ConvParser()
-        try:
-            pr.feed(raw)
-            pr.finish()
-            title, msgs = pr.title, pr.msgs
-        except Exception:
-            title, msgs = p.stem.rsplit("__", 1)[0], []
-        rel = p.relative_to(root).as_posix()
-        top = rel.split("/")[0]
-        cat = top if top in CATS else "other"
-        ctx = f"Kanal: {title}" if cat == "channels" else CAT_LABEL.get(cat, "Teams")
-        for i, m in enumerate(msgs):
-            recs.append({
-                "uid": f"teams:{rel}:{i}", "src": "teams", "root": "teams", "rel": rel,
-                "who": m["n"] or "(unbekannt)", "ppl": (m["n"] + " " + title).lower(),
-                "ts": parse_local(m["t"]), "date": m["t"], "title": title, "ctx": ctx,
-                "text": (m["x"] or "")[:SAFETY_CAP],
-            })
+    recs = []
+    for out in _pmap(_teams_file, files, root_dir):
+        recs.extend(out)
     return recs
 
 
@@ -151,6 +181,45 @@ def strip_html(s):
 
 def collapse(s, cap=SAFETY_CAP):
     return " ".join((s or "").split())[:cap]
+
+
+# In Mail-Threads wird die komplette Historie in jeder Antwort erneut zitiert –
+# in diesem Korpus oft >80 % des Textvolumens. Das bläht den Index auf (langsames
+# Einbetten) und verschlechtert das Retrieval (Duplikat-Rauschen). Wir schneiden
+# vor dem Chunking an der ersten Zitat-Grenze ab und behalten nur die neue
+# Nachricht. Konservativ: nur bei eindeutigen Outlook-/Mail-Client-Markern.
+_QUOTE_CUTS = [
+    re.compile(r"_{25,}"),                                  # Outlook-Trennlinie
+    re.compile(r"(?m)^\s*_{10,}\s*$"),                      # Trennlinie auf eigener Zeile
+    re.compile(r"-{3,}\s*(Original Message|Ursprüngliche Nachricht)\s*-{3,}", re.I),
+    re.compile(r"(?m)^\s*(From|Von):\s.*(?:\n.*){0,4}?^\s*(Sent|Gesendet|Date):\s", re.I),
+    re.compile(r"(?im)^[ \t>]*On\b.{0,300}?\bwrote:\s*$", re.S),
+    re.compile(r"(?im)^[ \t>]*Am\b.{0,300}?\bschrieb\b.{0,120}?:\s*$", re.S),
+]
+_SIG_CUTS = [
+    re.compile(r"(?m)^-- ?$"),                              # RFC-3676-Signaturtrenner
+    re.compile(r"(?im)^\s*Sent from (my |Outlook).*$"),
+    re.compile(r"(?im)^\s*Von meinem (iPhone|iPad|Samsung|Android).*$"),
+    re.compile(r"(?im)^\s*Get Outlook for (iOS|Android).*$"),
+]
+
+
+def strip_quoted(text):
+    """Zitierte Thread-Historie und Signatur abschneiden, neue Nachricht behalten."""
+    if not text:
+        return text
+    t = text.replace("\r\n", "\n").replace("\r", "\n")
+    cut = len(t)
+    for rx in _QUOTE_CUTS:
+        m = rx.search(t)
+        if m and m.start() < cut:
+            cut = m.start()
+    head = t[:cut]
+    for rx in _SIG_CUTS:
+        m = rx.search(head)
+        if m and m.start() > 0:
+            head = head[:m.start()]
+    return re.sub(r"(?m)^[ \t]*>.*$", "", head)            # restliche Zitatzeilen
 
 
 def hdr(msg, name):
@@ -189,6 +258,7 @@ def extract_body(msg):
     text = decode_part(part)
     if part.get_content_type() == "text/html":
         text = strip_html(text)
+    text = strip_quoted(text)
     return collapse(text)
 
 
@@ -207,36 +277,39 @@ def addr_people(msg, *headers):
     return names, emails
 
 
+def _outlook_file(p_str, root_str):
+    p, root = Path(p_str), Path(root_str)
+    try:
+        with open(p, "rb") as f:
+            msg = BytesParser(policy=policy.default).parse(f)
+    except Exception:
+        return None
+    fn, fe = addr_people(msg, "from")
+    tn, te = addr_people(msg, "to", "cc")
+    who = (fn[0] if fn else (fe[0] if fe else "")) or "(unbekannt)"
+    raw_date = hdr(msg, "date")
+    ts, disp = None, raw_date
+    try:
+        dt = email.utils.parsedate_to_datetime(raw_date)
+        if dt is not None:
+            ts = dt.timestamp()
+            disp = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+    rel = p.relative_to(root).as_posix()
+    folder = rel.rsplit("/", 1)[0] if "/" in rel else "(Stamm)"
+    return {
+        "uid": f"outlook:{rel}:0", "src": "outlook", "root": "outlook", "rel": rel,
+        "who": who, "ppl": " ".join(fn + fe + tn + te).lower(),
+        "ts": ts, "date": disp, "title": hdr(msg, "subject") or "(kein Betreff)",
+        "ctx": folder, "text": extract_body(msg),
+    }
+
+
 def load_outlook(root_dir):
-    recs = []
     root = Path(root_dir)
-    for p in sorted(root.rglob("*.eml")):
-        try:
-            with open(p, "rb") as f:
-                msg = BytesParser(policy=policy.default).parse(f)
-        except Exception:
-            continue
-        fn, fe = addr_people(msg, "from")
-        tn, te = addr_people(msg, "to", "cc")
-        who = (fn[0] if fn else (fe[0] if fe else "")) or "(unbekannt)"
-        raw_date = hdr(msg, "date")
-        ts, disp = None, raw_date
-        try:
-            dt = email.utils.parsedate_to_datetime(raw_date)
-            if dt is not None:
-                ts = dt.timestamp()
-                disp = dt.astimezone().strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
-        rel = p.relative_to(root).as_posix()
-        folder = rel.rsplit("/", 1)[0] if "/" in rel else "(Stamm)"
-        recs.append({
-            "uid": f"outlook:{rel}:0", "src": "outlook", "root": "outlook", "rel": rel,
-            "who": who, "ppl": " ".join(fn + fe + tn + te).lower(),
-            "ts": ts, "date": disp, "title": hdr(msg, "subject") or "(kein Betreff)",
-            "ctx": folder, "text": extract_body(msg),
-        })
-    return recs
+    files = sorted(root.rglob("*.eml"))
+    return [r for r in _pmap(_outlook_file, files, root_dir) if r is not None]
 
 
 # --------------------------------------------------------------------------
@@ -305,47 +378,50 @@ def _ics_when(val, dateonly):
         return None, val
 
 
+def _calendar_file(p_str, root_str):
+    p, root = Path(p_str), Path(root_str)
+    summary = location = description = org_cn = org_mail = dtstart = ""
+    dateonly = False
+    att_names, att_mails = [], []
+    for line in _unfold(p.read_text(encoding="utf-8", errors="replace")):
+        name, params, value = _prop(line)
+        if not name:
+            continue
+        if name == "SUMMARY":
+            summary = _unescape(value)
+        elif name == "LOCATION":
+            location = _unescape(value)
+        elif name == "DESCRIPTION":
+            description = _unescape(value)
+        elif name == "DTSTART":
+            dtstart = value.strip()
+            dateonly = "VALUE=DATE" in (params or "").upper()
+        elif name == "ORGANIZER":
+            org_cn, org_mail = _pval(params, "CN"), _demail(value)
+        elif name == "ATTENDEE":
+            cn, mail = _pval(params, "CN"), _demail(value)
+            if cn:
+                att_names.append(cn)
+            if mail:
+                att_mails.append(mail)
+    ts, disp = _ics_when(dtstart, dateonly)
+    rel = p.relative_to(root).as_posix()
+    segs = rel.split("/")
+    cal = segs[1] if len(segs) >= 3 and segs[0] == "kalender" else "Kalender"
+    ppl = " ".join(x for x in ([org_cn, org_mail] + att_names + att_mails) if x).lower()
+    text = ((f"Ort: {location}. " if location else "") + description).strip()
+    return {
+        "uid": f"kalender:{rel}:0", "src": "kalender", "root": "outlook", "rel": rel,
+        "who": org_cn or org_mail or "(unbekannt)", "ppl": ppl,
+        "ts": ts, "date": disp, "title": summary or "(kein Betreff)",
+        "ctx": f"Kalender: {cal}", "text": text[:SAFETY_CAP],
+    }
+
+
 def load_calendar(root_dir):
-    recs = []
     root = Path(root_dir)
-    for p in sorted(root.rglob("*.ics")):
-        summary = location = description = org_cn = org_mail = dtstart = ""
-        dateonly = False
-        att_names, att_mails = [], []
-        for line in _unfold(p.read_text(encoding="utf-8", errors="replace")):
-            name, params, value = _prop(line)
-            if not name:
-                continue
-            if name == "SUMMARY":
-                summary = _unescape(value)
-            elif name == "LOCATION":
-                location = _unescape(value)
-            elif name == "DESCRIPTION":
-                description = _unescape(value)
-            elif name == "DTSTART":
-                dtstart = value.strip()
-                dateonly = "VALUE=DATE" in (params or "").upper()
-            elif name == "ORGANIZER":
-                org_cn, org_mail = _pval(params, "CN"), _demail(value)
-            elif name == "ATTENDEE":
-                cn, mail = _pval(params, "CN"), _demail(value)
-                if cn:
-                    att_names.append(cn)
-                if mail:
-                    att_mails.append(mail)
-        ts, disp = _ics_when(dtstart, dateonly)
-        rel = p.relative_to(root).as_posix()
-        segs = rel.split("/")
-        cal = segs[1] if len(segs) >= 3 and segs[0] == "kalender" else "Kalender"
-        ppl = " ".join(x for x in ([org_cn, org_mail] + att_names + att_mails) if x).lower()
-        text = ((f"Ort: {location}. " if location else "") + description).strip()
-        recs.append({
-            "uid": f"kalender:{rel}:0", "src": "kalender", "root": "outlook", "rel": rel,
-            "who": org_cn or org_mail or "(unbekannt)", "ppl": ppl,
-            "ts": ts, "date": disp, "title": summary or "(kein Betreff)",
-            "ctx": f"Kalender: {cal}", "text": text[:SAFETY_CAP],
-        })
-    return recs
+    files = sorted(root.rglob("*.ics"))
+    return [r for r in _pmap(_calendar_file, files, root_dir) if r is not None]
 
 
 def load_contacts(root_dir):
