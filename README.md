@@ -117,7 +117,8 @@ The token mode needs the right scopes consented in Graph Explorer
 ## 4. Export tools
 
 Each export tool is interactive (it asks what to export) and resumable — re-running
-it only fetches new/changed items. An optional argument sets the output folder.
+it only fetches new/changed items. An optional argument sets the output folder, and
+`-default` skips the questions and starts right away (see *Export options*).
 
 ### Teams — chats and channels → HTML
 
@@ -168,6 +169,25 @@ resumes; deleting the folder forces a full re-export):
 python3 teams_export.py   my_teams_archive
 python3 outlook_export.py my_outlook_archive
 ```
+
+**Unattended runs (`-default`)** — pass `-default` (or `--default`) to skip the
+interactive questions and start immediately with the default selection. Handy for
+schedulers and cron jobs. It combines with the output folder in any order:
+
+```
+python3 teams_export.py   -default
+python3 outlook_export.py -default my_outlook_archive
+```
+
+What the default selection is:
+
+| Tool | `-default` exports |
+|---|---|
+| `teams_export.py` | Options 1, 2 and 3 — 1:1 chats, group chats and meeting chats. Team channels are **not** included (they'd require picking teams). |
+| `outlook_export.py` | Mail, calendar and contacts: all mailbox folders except the `DEFAULT_SKIP_FOLDERS` ones (Archive, Drafts, Deleted Items, Junk, Outbox), the default calendar only, and all contacts. |
+
+These are the same defaults you get by pressing Enter at every prompt, and the same
+ones used when there is no interactive terminal (e.g. output piped to a file).
 
 A few options are switches near the top of each script (edit the file to change them):
 

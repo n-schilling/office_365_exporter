@@ -14,7 +14,9 @@ Outlook/Exchange-Export als .eml über Microsoft Graph (delegiert, kein Admin n�
   Grenze; bei 429 wird mit Retry-After zurückgenommen.
 
 Setup:   pip install msal requests
-Start:   python3 outlook_export.py [ausgabe-ordner]
+Start:   python3 outlook_export.py [ausgabe-ordner] [-default]
+         -default überspringt alle Abfragen und nutzt die Vorgaben (E-Mail ohne
+         Archiv/Entwürfe/Gelöschte/Junk/Postausgang, Standardkalender, Kontakte).
 
 Token-Modus (wenn der Tenant für neue Apps "Approval required" verlangt):
     Access Token im Graph Explorer holen (Mail.Read muss zugestimmt sein; für
@@ -91,6 +93,7 @@ DEFAULT_SKIP_FOLDERS = {
 SESSION = requests.Session()
 GATE = threading.BoundedSemaphore(WORKERS)   # hält gleichzeitige Postfach-Calls <= WORKERS
 STOP = threading.Event()                     # Signal: Token tot -> nichts Neues mehr starten
+ASSUME_DEFAULT = False                       # -default: keine Abfragen, überall die Vorgabe
 
 
 class TokenExpired(RuntimeError):
@@ -319,6 +322,11 @@ def _read(prompt):
         return ""
 
 
+def _interactive():
+    """Nur fragen, wenn ein Terminal da ist und -default nicht gesetzt wurde."""
+    return sys.stdin.isatty() and not ASSUME_DEFAULT
+
+
 def parse_indices(raw, n):
     out = []
     for tok in re.split(r"[\s,]+", raw.strip()):
@@ -349,8 +357,8 @@ def prompt_categories():
     options = [("mail", "E-Mail (Postfach-Ordner)"),
                ("calendar", "Kalender"),
                ("contacts", "Kontakte")]
-    if not sys.stdin.isatty():
-        print("Kein interaktives Terminal – exportiere E-Mail, Standardkalender und Kontakte.")
+    if not _interactive():
+        print("Standardauswahl – exportiere E-Mail, Standardkalender und Kontakte.")
         return {k for k, _ in options}
     print("\nWas möchtest du exportieren? (Mehrfachauswahl möglich, z. B. 1,2)")
     for i, (_, label) in enumerate(options, 1):
@@ -377,7 +385,7 @@ def select_mail_folders(tops):
     angezeigt, aber nur auf explizite Auswahl exportiert. Mehrfachauswahl möglich."""
     tops.sort(key=lambda t: (t["folder"].get("displayName") or "").lower())
     default = [t for t in tops if not _is_default_skip(t)]
-    if not tops or not sys.stdin.isatty():
+    if not tops or not _interactive():
         return default
     n = len(tops)
     print("\nWelche Postfach-Ordner? (Mehrfachauswahl; Enter = alle ohne die mit (aus); inkl. Unterordner)")
@@ -402,7 +410,7 @@ def select_calendars(cals):
     if not cals:
         return []
     default = [c for c in cals if c.get("isDefaultCalendar")] or cals[:1]
-    if not sys.stdin.isatty():
+    if not _interactive():
         return default
     n = len(cals)
     print("\nWelche Kalender? (Mehrfachauswahl; Enter = nur Standardkalender)")
@@ -911,9 +919,14 @@ def migrate_to_email_subdir(out, done):
 
 
 def main():
-    global OUT_ROOT, GATE
-    if len(sys.argv) > 1:
-        OUT_ROOT = sys.argv[1]
+    global OUT_ROOT, GATE, ASSUME_DEFAULT
+    argv = sys.argv[1:]
+    if any(a in ("-default", "--default") for a in argv):
+        ASSUME_DEFAULT = True
+        print("Standardauswahl (-default) aktiv – keine Abfragen.")
+    argv = [a for a in argv if a not in ("-default", "--default")]
+    if argv:
+        OUT_ROOT = argv[0]
 
     workers = WORKERS
     env = os.environ.get("EXPORT_WORKERS")

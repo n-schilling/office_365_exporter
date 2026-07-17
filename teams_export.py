@@ -18,7 +18,9 @@ PARALLEL: mehrere Chats/Kanäle gleichzeitig (Standard 4, per Env EXPORT_WORKERS
   abgefangen.
 
 Setup:   pip install msal requests
-Start:   python3 teams_export.py [ausgabe-ordner]
+Start:   python3 teams_export.py [ausgabe-ordner] [-default]
+         -default überspringt die Abfrage und nutzt die Vorgabe (1, 2, 3 =
+         1:1-, Gruppen- und Meeting-Chats, keine Kanäle).
 
 Token-Modus (wenn der Tenant für neue Apps "Approval required" verlangt):
     Access Token im Graph Explorer holen (Chat.Read bzw. ChannelMessage.Read.All
@@ -344,20 +346,25 @@ def parse_indices(raw, n):
     return out
 
 
+def default_categories(options):
+    """Standardauswahl: die ersten drei Kategorien (1:1-, Gruppen-, Meeting-Chats)."""
+    return {k for k, _ in options[:3]}
+
+
 def prompt_categories(options):
     if not sys.stdin.isatty():
-        print("Kein interaktives Terminal – exportiere alle Kategorien.")
-        return {k for k, _ in options}
+        print("Kein interaktives Terminal – nutze die Standardauswahl (1, 2, 3).")
+        return default_categories(options)
     print("Was möchtest du exportieren?")
     for i, (k, label) in enumerate(options, 1):
         print(f"  {i}) {label}")
-    raw = _read("Auswahl (Zahlen kommagetrennt, Enter = alle): ").strip()
+    raw = _read("Auswahl (Zahlen kommagetrennt, Enter = 1,2,3): ").strip()
     if not raw:
-        return {k for k, _ in options}
+        return default_categories(options)
     idxs = parse_indices(raw, len(options))
     if not idxs:
-        print("Keine gültige Auswahl – nehme alle.")
-        return {k for k, _ in options}
+        print("Keine gültige Auswahl – nehme die Standardauswahl (1, 2, 3).")
+        return default_categories(options)
     return {options[i - 1][0] for i in idxs}
 
 
@@ -942,8 +949,11 @@ def run_parallel(runners, stats, workers):
 # ---------------------------------------------------------------------------
 def main():
     global _client, OUT_ROOT, GATE, IMGCACHE_DIR
-    if len(sys.argv) > 1:
-        OUT_ROOT = sys.argv[1]
+    argv = sys.argv[1:]
+    use_default = any(a in ("-default", "--default") for a in argv)
+    argv = [a for a in argv if a not in ("-default", "--default")]
+    if argv:
+        OUT_ROOT = argv[0]
 
     workers = WORKERS
     env = os.environ.get("EXPORT_WORKERS")
@@ -959,7 +969,11 @@ def main():
     # 1) Kategorien abfragen (vor dem Login, damit der Kanal-Scope nur bei Bedarf kommt)
     cat_options = [("1on1", "1:1-Chats"), ("group", "Gruppenchats"),
                    ("meeting", "Meeting-Chats"), ("channels", "Team-Kanäle")]
-    categories = prompt_categories(cat_options)
+    if use_default:
+        categories = default_categories(cat_options)
+        print("Standardauswahl (-default) aktiv – keine Abfrage.")
+    else:
+        categories = prompt_categories(cat_options)
     labels = {k: v for k, v in cat_options}
     print("Gewählt:", ", ".join(labels[k] for k in
                                  ["1on1", "group", "meeting", "channels"] if k in categories))
