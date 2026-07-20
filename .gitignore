@@ -11,3 +11,4 @@ __pycache__/*
 *.zip
 rag_store
 rag_store/*
+.coverage

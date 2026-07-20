@@ -15,7 +15,7 @@ import hashlib
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from html.parser import HTMLParser
 from functools import partial
@@ -371,7 +371,7 @@ def _ics_when(val, dateonly):
         utc = val.endswith("Z")
         dt = datetime.strptime(val.rstrip("Z")[:15], "%Y%m%dT%H%M%S")
         if utc:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
             return dt.timestamp(), dt.astimezone().strftime("%Y-%m-%d %H:%M")
         return dt.timestamp(), dt.strftime("%Y-%m-%d %H:%M")
     except Exception:

@@ -57,7 +57,7 @@ def embed(texts, model, url, timeout=600):
                           json={"model": model, "input": texts}, timeout=timeout)
     except requests.exceptions.ConnectionError:
         raise SystemExit(f"Keine Verbindung zu Ollama unter {url}. "
-                         f"Läuft 'ollama serve'?")
+                         f"Läuft 'ollama serve'?") from None
     if r.status_code == 404:
         raise SystemExit(f"Modell '{model}' nicht gefunden. Vorher: ollama pull {model}")
     r.raise_for_status()

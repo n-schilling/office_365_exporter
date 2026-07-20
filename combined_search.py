@@ -26,7 +26,7 @@ import html as html_lib
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from urllib.parse import quote
 from html.parser import HTMLParser
@@ -344,7 +344,7 @@ def _ics_when(val, dateonly):
         utc = val.endswith("Z")
         dt = datetime.strptime(val.rstrip("Z")[:15], "%Y%m%dT%H%M%S")
         if utc:
-            dt = dt.replace(tzinfo=timezone.utc)
+            dt = dt.replace(tzinfo=UTC)
             return dt.timestamp(), dt.astimezone().strftime("%Y-%m-%d %H:%M")
         return dt.timestamp(), dt.strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -491,7 +491,9 @@ def build(teams_dir, outlook_dir, output):
         "people": sorted(people, key=str.lower),
         "recs": recs,
     }
-    payload = json.dumps(index, ensure_ascii=False).replace("</", "<\\/")
+    # "<" als \u003c einbetten: neutralisiert </script>, <script und <!--,
+    # die der Browser sonst im Script-Block interpretiert (JSON.parse bleibt gleich).
+    payload = json.dumps(index, ensure_ascii=False).replace("<", "\\u003c")
     html = TEMPLATE.replace("/*__INDEX__*/", payload)
     output.write_text(html, encoding="utf-8")
     return output, counts

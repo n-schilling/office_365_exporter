@@ -17,13 +17,13 @@ outlook_export.py ┘                        └─ rag_index.py → rag_store/
 |---|---|
 | `teams_export.py` | Teams 1:1/group/meeting chats and channels → HTML |
 | `outlook_export.py` | Mail (`.eml`), calendar (`.ics`), contacts (`.vcf`) |
-| `teams_search.py` / `outlook_search.py` / `combined_search.py` | Self-contained offline `search.html` |
+| `combined_search.py` | Self-contained offline search page (Teams + Mail + calendar + contacts) |
 | `rag_index.py` | Builds the search index (`rag_store/`: SQLite + FTS5 + embeddings) |
 | `mcp_server.py` | MCP server — Claude searches and reads the exports itself |
 | `rag_server.py` | Local RAG web UI with AI answers (fully offline via Ollama) |
 | `corpus.py` | Shared export parsing (used internally) |
 
-Everything runs on macOS, Windows and Linux with Python 3.7+ (MCP server: 3.10+).
+Everything runs on macOS, Windows and Linux with Python 3.11+.
 Commands below use `python3`; on Windows type `python` instead.
 
 ---
@@ -127,19 +127,18 @@ default calendar and all contacts. Same as pressing Enter at every prompt.
 
 ---
 
-## 4. Static search pages (offline, no install)
+## 4. Static search page (offline, no install)
 
-Each tool reads an export folder and writes a self-contained `search.html`:
+`combined_search.py` reads both export folders (either may be missing) and
+writes one self-contained search page with person, date and source filters:
 
 ```bash
-python3 teams_search.py                # → teams_export/search.html
-python3 outlook_search.py              # → outlook_export/search.html
-python3 combined_search.py             # → both in one page
+python3 combined_search.py             # → combined_search.html
 ```
 
-`combined_search.py` accepts custom folders (`[teams] [outlook] [-o out.html]`)
-and writes the page to the common parent folder of both exports — don't move it
-afterwards, the links are relative.
+It accepts custom folders (`[teams] [outlook] [-o out.html]`) and writes the
+page to the common parent folder of both exports — don't move it afterwards,
+the links are relative.
 
 ---
 

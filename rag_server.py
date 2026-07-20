@@ -239,7 +239,7 @@ class Handler(BaseHTTPRequestHandler):
         except requests.exceptions.RequestException:
             return self._json({"error": f"Ollama nicht erreichbar ({STATE['ollama']}). "
                                         f"Läuft 'ollama serve' und sind die Modelle geladen?"}, 502)
-        sources = [hit_dict(c, s) for c, (_, s) in zip(picked, pairs)]
+        sources = [hit_dict(c, s) for c, (_, s) in zip(picked, pairs, strict=True)]
         return self._json({"answer": answer, "sources": sources})
 
 

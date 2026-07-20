@@ -38,7 +38,7 @@ import time
 import html
 import hashlib
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
@@ -47,7 +47,7 @@ try:
     import requests
 except ImportError:
     print("Fehlende Pakete. Bitte installieren:  pip install msal requests")
-    raise SystemExit(1)
+    raise SystemExit(1) from None
 
 # Auf Windows nutzt die Konsole standardmäßig eine Legacy-Codepage (z. B. cp1252),
 # und bei Umleitung in eine Datei (python … > log.txt) die Locale-Kodierung. Beides
@@ -183,8 +183,7 @@ class Graph:
     def paged(self, url, params=None, extra_headers=None):
         data = self.get(url, params, extra_headers)
         while True:
-            for item in data.get("value", []):
-                yield item
+            yield from data.get("value", [])
             nxt = data.get("@odata.nextLink")
             if not nxt:
                 break
@@ -256,8 +255,7 @@ class TokenClient:
     def paged(self, url, params=None, extra_headers=None):
         data = self.get(url, params, extra_headers)
         while True:
-            for item in data.get("value", []):
-                yield item
+            yield from data.get("value", [])
             nxt = data.get("@odata.nextLink")
             if not nxt:
                 break
@@ -724,7 +722,7 @@ def build_ics(ev):
     all_day = bool(ev.get("isAllDay"))
     uid = ev.get("iCalUId") or ev.get("id") or short_id(ev.get("subject") or "")
     stamp = _graph_dt(ev.get("lastModifiedDateTime") or ev.get("createdDateTime") or "")
-    dtstamp = (stamp or datetime.now(timezone.utc).replace(tzinfo=None)).strftime("%Y%m%dT%H%M%SZ")
+    dtstamp = (stamp or datetime.now(UTC).replace(tzinfo=None)).strftime("%Y%m%dT%H%M%SZ")
     L = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//outlook_export//Graph//DE",
          "CALSCALE:GREGORIAN", "METHOD:PUBLISH", "BEGIN:VEVENT",
          f"UID:{_esc(uid)}", f"DTSTAMP:{dtstamp}"]
@@ -779,18 +777,20 @@ def export_calendar(graph, out, done, stats, cals):
         try:
             for ev in graph.paged(url, {"$top": PAGE, "$select": select}, extra_headers=pref):
                 seen += 1
-                eid = ev.get("id")
-                if eid and done.is_done(out, eid):
+                rel = f"kalender/{cname}/{event_filename(ev)}"
+                # Termine ohne Graph-ID: Dateipfad als stabiler Ersatzschlüssel,
+                # sonst landet der Schlüssel None im Log und Resume greift nie.
+                key = ev.get("id") or ev.get("iCalUId") or rel
+                if done.is_done(out, key):
                     stats["skipped"] += 1
                     continue
-                rel = f"kalender/{cname}/{event_filename(ev)}"
                 (out / "kalender" / cname).mkdir(parents=True, exist_ok=True)
                 try:
                     (out / rel).write_text(build_ics(ev), encoding="utf-8")
                 except Exception as e:
                     print(f"    Termin übersprungen ({e})")
                     continue
-                done.mark(eid, rel)
+                done.mark(key, rel)
                 stats["new"] += 1
                 if stats["new"] % 100 == 0:
                     print(f"  … {stats['new']} neu exportiert")
@@ -859,18 +859,20 @@ def export_contacts(graph, out, done, stats):
         try:
             for c in graph.paged(url, {"$top": PAGE, "$select": select}):
                 seen += 1
-                cid = c.get("id")
-                if cid and done.is_done(out, cid):
+                rel = f"{rel_dir}/{contact_filename(c)}"
+                # Kontakte ohne Graph-ID: Dateipfad als stabiler Ersatzschlüssel
+                # (sonst Schlüssel None im Log und Re-Export bei jedem Lauf).
+                key = c.get("id") or rel
+                if done.is_done(out, key):
                     stats["skipped"] += 1
                     continue
-                rel = f"{rel_dir}/{contact_filename(c)}"
                 (out / rel_dir).mkdir(parents=True, exist_ok=True)
                 try:
                     (out / rel).write_text(build_vcf(c), encoding="utf-8")
                 except Exception as e:
                     print(f"    Kontakt übersprungen ({e})")
                     continue
-                done.mark(cid, rel)
+                done.mark(key, rel)
                 stats["new"] += 1
         except TokenExpired:
             raise

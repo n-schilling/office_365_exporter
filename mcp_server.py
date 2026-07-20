@@ -467,9 +467,15 @@ def list_people(source: str = "all", contains: str = "", limit: int = 100) -> di
             conds.append("src = ?")
             params.append(source)
         if contains.strip():
-            conds.append("(who LIKE ? OR ppl LIKE ?)")
+            # SQLite's LIKE/lower() are ASCII-only; register Python lower() so
+            # umlaut-cased input ("MÜLLER") still matches. ppl is stored
+            # pre-lowercased by the indexer, so only `who` needs folding.
+            con.create_function("py_lower", 1,
+                                lambda s: s.lower() if isinstance(s, str) else s,
+                                deterministic=True)
+            conds.append("(py_lower(who) LIKE ? OR ppl LIKE ?)")
             pat = f"%{contains.strip().lower()}%"
-            params += [f"%{contains.strip()}%", pat]
+            params += [pat, pat]
         where = " AND ".join(conds)
         rows = con.execute(
             f"SELECT who, SUM(messages) AS m FROM people WHERE {where} "

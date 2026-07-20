@@ -56,7 +56,7 @@ try:
     import requests
 except ImportError:
     print("Fehlende Pakete. Bitte installieren:  pip install msal requests")
-    raise SystemExit(1)
+    raise SystemExit(1) from None
 
 # Auf Windows nutzt die Konsole standardmäßig eine Legacy-Codepage (z. B. cp1252),
 # und bei Umleitung in eine Datei (python … > log.txt) die Locale-Kodierung. Beides
@@ -242,8 +242,7 @@ class Graph:
     def paged(self, url, params=None):
         data = self.get(url, params)
         while True:
-            for item in data.get("value", []):
-                yield item
+            yield from data.get("value", [])
             nxt = data.get("@odata.nextLink")
             if not nxt:
                 break
@@ -318,8 +317,7 @@ class TokenClient:
     def paged(self, url, params=None):
         data = self.get(url, params)
         while True:
-            for item in data.get("value", []):
-                yield item
+            yield from data.get("value", [])
             nxt = data.get("@odata.nextLink")
             if not nxt:
                 break
@@ -356,7 +354,7 @@ def prompt_categories(options):
         print("Kein interaktives Terminal – nutze die Standardauswahl (1, 2, 3).")
         return default_categories(options)
     print("Was möchtest du exportieren?")
-    for i, (k, label) in enumerate(options, 1):
+    for i, (_k, label) in enumerate(options, 1):
         print(f"  {i}) {label}")
     raw = _read("Auswahl (Zahlen kommagetrennt, Enter = 1,2,3): ").strip()
     if not raw:
