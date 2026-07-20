@@ -383,8 +383,13 @@ qEl.focus();
 
 def load_store(store):
     sp = Path(store)
-    meta = json.loads((sp / "meta.json").read_text(encoding="utf-8"))
-    V = np.load(sp / "vectors.npy")
+    import sqlite3
+    con = sqlite3.connect(f"file:{sp / 'corpus.db'}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    meta = [dict(r) for r in con.execute("SELECT * FROM chunks ORDER BY id")]
+    con.close()
+    # Vektoren liegen als float16 – fürs Skalarprodukt nach float32
+    V = np.load(sp / "vectors.npy").astype("float32", copy=False)
     return meta, V
 
 

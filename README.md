@@ -1,281 +1,226 @@
 # Office 365 Export
 
-Tools to export Microsoft 365 data (Teams chats/channels, Outlook mail, calendar
-and contacts) via Microsoft Graph — delegated access, no admin consent required —
-and to search the exports offline.
+Export your Microsoft 365 data (Teams chats/channels, Outlook mail, calendar,
+contacts) via Microsoft Graph — delegated access, no admin consent required —
+and search the exports offline: as a static HTML page, through **Claude** (MCP),
+or with a local RAG web UI.
 
-All scripts run on **macOS, Windows and Linux** with Python 3.7 or newer.
+```
+teams_export.py  ─┐                        ┌─ *_search.py      → static search.html
+                  ├─ local export folders ─┤
+outlook_export.py ┘                        └─ rag_index.py → rag_store/
+                                                ├─ mcp_server.py → Claude (MCP tools)
+                                                └─ rag_server.py → RAG web UI (Ollama)
+```
+
+| Script | Purpose |
+|---|---|
+| `teams_export.py` | Teams 1:1/group/meeting chats and channels → HTML |
+| `outlook_export.py` | Mail (`.eml`), calendar (`.ics`), contacts (`.vcf`) |
+| `teams_search.py` / `outlook_search.py` / `combined_search.py` | Self-contained offline `search.html` |
+| `rag_index.py` | Builds the search index (`rag_store/`: SQLite + FTS5 + embeddings) |
+| `mcp_server.py` | MCP server — Claude searches and reads the exports itself |
+| `rag_server.py` | Local RAG web UI with AI answers (fully offline via Ollama) |
+| `corpus.py` | Shared export parsing (used internally) |
+
+Everything runs on macOS, Windows and Linux with Python 3.7+ (MCP server: 3.10+).
+Commands below use `python3`; on Windows type `python` instead.
 
 ---
 
-## 1. Prerequisites
+## 1. Setup
 
-- **Python 3.7+** — check with `python3 --version` (macOS/Linux) or `python --version` (Windows).
-  - Windows: install from [python.org](https://www.python.org/downloads/) and tick
-    *"Add python.exe to PATH"* during setup.
-- The **export** tools need two packages: `msal` and `requests`.
-- The **search** tools (`teams_search.py`, `outlook_search.py`, `combined_search.py`)
-  use only the Python standard library — no installation needed.
-
----
-
-## 2. Install the requirements
-
-Use a virtual environment so nothing is installed system-wide.
-
-### macOS / Linux
+Create a virtual environment and install what you need:
 
 ```bash
 python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install msal requests
+source .venv/bin/activate              # Windows PowerShell: .\.venv\Scripts\Activate.ps1
+python3 -m pip install msal requests   # export tools
+python3 -m pip install mcp numpy       # only for the MCP server / AI search
 ```
 
-### Windows (PowerShell)
+The static search tools need no packages at all.
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install msal requests
-```
-
-> If PowerShell blocks the activation script, run once:
+> PowerShell blocks the activation script? Run once:
 > `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`
 
-### Windows (Command Prompt / cmd.exe)
-
-```bat
-python -m venv .venv
-.venv\Scripts\activate.bat
-python -m pip install msal requests
-```
-
-### Windows — standalone (embeddable) Python, no install / no admin rights
-
-If you can't (or don't want to) install Python system-wide, use the official
-**Windows embeddable package** — a self-contained Python you just unzip. It has no
-`pip` by default, so there are a couple of extra steps.
+<details>
+<summary>Windows without install rights: standalone (embeddable) Python</summary>
 
 1. Download the **"Windows embeddable package (64-bit)"** from
    [python.org/downloads/windows](https://www.python.org/downloads/windows/) and
    unzip it, e.g. to `C:\python-standalone`.
-2. Enable `site-packages` so installed packages can be imported. In that folder,
-   open the file named like `python3XX._pth` (e.g. `python311._pth`) in a text
-   editor and **remove the `#` in front of** `import site`:
-
-   ```
-   import site
-   ```
-3. Bootstrap `pip` (run these in PowerShell from the unzipped folder):
+2. In that folder, open `python3XX._pth` in a text editor and remove the `#`
+   before `import site`.
+3. Bootstrap pip and install the packages (PowerShell, in that folder):
 
    ```powershell
-   cd C:\python-standalone
    Invoke-WebRequest https://bootstrap.pypa.io/get-pip.py -OutFile get-pip.py
    .\python.exe get-pip.py
-   ```
-4. Install the export packages:
-
-   ```powershell
    .\python.exe -m pip install msal requests
    ```
 
-From then on, call this Python by its full path (`C:\python-standalone\python.exe`)
-wherever the commands below say `python`, for example:
-
-```powershell
-C:\python-standalone\python.exe teams_export.py
-```
-
-> The embeddable package is self-contained, so a virtual environment isn't needed —
-> packages install into the standalone folder itself.
-
-In every following command, use `python3` on macOS/Linux and `python` on Windows.
-The example commands below show macOS/Linux first, then the Windows equivalent.
+Then run every command with the full path, e.g.
+`C:\python-standalone\python.exe teams_export.py`. No virtual environment
+needed — packages install into the standalone folder itself.
+</details>
 
 ---
 
-## 3. Authentication
+## 2. Authentication
 
 The export scripts sign you in interactively (a browser window opens). If your
-tenant requires admin approval for new apps, use a pasted token instead:
+tenant requires admin approval for new apps, paste a token instead:
 
-1. Open the [Microsoft Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer)
-2. Log in
-3. Open the **"Access token"** tab and copy the token
-4. Save it as `gx_token.txt` next to the scripts, **or** set an environment variable:
+1. Log in at the [Microsoft Graph Explorer](https://developer.microsoft.com/en-us/graph/graph-explorer)
+   and copy the token from the **"Access token"** tab.
+2. Save it as `gx_token.txt` next to the scripts, or set it as the `GRAPH_TOKEN`
+   environment variable.
 
-   - macOS/Linux: `export GRAPH_TOKEN="eyJ0…"`
-   - Windows (PowerShell): `$env:GRAPH_TOKEN = "eyJ0…"`
-   - Windows (cmd): `set GRAPH_TOKEN=eyJ0…`
-
-The token mode needs the right scopes consented in Graph Explorer
-(`Chat.Read`/`ChannelMessage.Read.All` for Teams; `Mail.Read`, and additionally
-`Calendars.Read` / `Contacts.Read` for Outlook calendar/contacts).
+Token mode needs the right scopes consented in Graph Explorer:
+`Chat.Read` / `ChannelMessage.Read.All` (Teams), `Mail.Read`, plus
+`Calendars.Read` / `Contacts.Read` for calendar/contacts.
 
 ---
 
-## 4. Export tools
+## 3. Export
 
-Each export tool is interactive (it asks what to export) and resumable — re-running
-it only fetches new/changed items. An optional argument sets the output folder, and
-`-default` skips the questions and starts right away (see *Export options*).
-
-### Teams — chats and channels → HTML
-
-macOS/Linux:
 ```bash
-python3 teams_export.py            # default folder: teams_export
-```
-Windows:
-```powershell
-python teams_export.py
+python3 teams_export.py                # → teams_export/
+python3 outlook_export.py              # → outlook_export/
 ```
 
-### Outlook — mail (.eml), calendar (.ics), contacts (.vcf)
+Both tools are interactive (they ask what to export) and **resumable** —
+re-running only fetches new/changed items. Deleting the folder forces a full
+re-export.
 
-macOS/Linux:
+**Common variations:**
+
 ```bash
-python3 outlook_export.py          # default folder: outlook_export
-```
-Windows:
-```powershell
-python outlook_export.py
+python3 teams_export.py my_archive     # custom output folder
+python3 outlook_export.py -default     # no questions, default selection
+                                       #   (ideal for cron/scheduled runs)
 ```
 
-### Export options
+`-default` exports: Teams — 1:1, group and meeting chats (no channels);
+Outlook — mail (except Archive, Drafts, Deleted Items, Junk, Outbox), the
+default calendar and all contacts. Same as pressing Enter at every prompt.
 
-The exports are interactive (you pick what to export) and resumable. The most
-useful options are environment variables — set them before running, no code edits
-needed:
+**Options** (environment variables, e.g. `EXPORT_WORKERS=2 python3 teams_export.py`):
 
 | Variable | Applies to | Default | What it does |
 |---|---|---|---|
-| `EXPORT_WORKERS` | both | `4` | Parallel conversations/downloads. `4` is the sensible maximum — Exchange/Teams throttle harder above it. Lower it (e.g. `1`) on flaky connections. |
-| `GRAPH_TOKEN` | both | — | Use a pasted Graph token instead of the browser login (see *Authentication*). |
-| `REFRESH_CHANNELS` | Teams | `1` | `0` exports Teams channels only once; otherwise channels are re-checked for new replies on every run. |
-| `CACHE_IMAGES` | Teams | `1` | `0` disables caching of inline images (saves disk, re-downloads on every re-export). |
-| `SKIP_EMPTY_CHATS` | Teams | `1` | `0` also exports chats that contain only system messages (joins, calls, …). |
+| `EXPORT_WORKERS` | both | `4` | Parallel downloads. `4` is the sensible max (throttling); use `1` on flaky connections. |
+| `GRAPH_TOKEN` | both | — | Pasted Graph token instead of browser login (section 2). |
+| `REFRESH_CHANNELS` | Teams | `1` | `0` = don't re-check exported channels for new replies. |
+| `CACHE_IMAGES` | Teams | `1` | `0` = don't cache inline images (saves disk, slower re-export). |
+| `SKIP_EMPTY_CHATS` | Teams | `1` | `0` = also export chats with only system messages. |
 
-Set a variable like this (example: 2 workers):
+<details>
+<summary>Switches at the top of each script (edit the file)</summary>
 
-- macOS/Linux: `EXPORT_WORKERS=2 python3 teams_export.py`
-- Windows (PowerShell): `$env:EXPORT_WORKERS=2; python teams_export.py`
-- Windows (cmd): `set EXPORT_WORKERS=2 && python teams_export.py`
-
-**Output folder** — pass it as the first argument (re-running into the same folder
-resumes; deleting the folder forces a full re-export):
-
-```
-python3 teams_export.py   my_teams_archive
-python3 outlook_export.py my_outlook_archive
-```
-
-**Unattended runs (`-default`)** — pass `-default` (or `--default`) to skip the
-interactive questions and start immediately with the default selection. Handy for
-schedulers and cron jobs. It combines with the output folder in any order:
-
-```
-python3 teams_export.py   -default
-python3 outlook_export.py -default my_outlook_archive
-```
-
-What the default selection is:
-
-| Tool | `-default` exports |
-|---|---|
-| `teams_export.py` | Options 1, 2 and 3 — 1:1 chats, group chats and meeting chats. Team channels are **not** included (they'd require picking teams). |
-| `outlook_export.py` | Mail, calendar and contacts: all mailbox folders except the `DEFAULT_SKIP_FOLDERS` ones (Archive, Drafts, Deleted Items, Junk, Outbox), the default calendar only, and all contacts. |
-
-These are the same defaults you get by pressing Enter at every prompt, and the same
-ones used when there is no interactive terminal (e.g. output piped to a file).
-
-A few options are switches near the top of each script (edit the file to change them):
-
-- `USE_DEVICE_CODE = True` — log in with a device code instead of opening a browser
-  (useful on headless machines).
-- Teams `EMBED_IMAGES = False` — don't embed inline images as base64 (smaller HTML).
-- Outlook `INCLUDE_HIDDEN = True` — also export hidden system folders
-  (Conversation History, Sync Issues, …).
-- Outlook `DEFAULT_SKIP_FOLDERS` — folders excluded when you just press Enter
-  (Archive, Drafts, Deleted Items, Junk, Outbox); you can still pick them explicitly.
+- `USE_DEVICE_CODE = True` — device-code login instead of a browser (headless machines).
+- Teams `EMBED_IMAGES = False` — don't embed images as base64 (smaller HTML).
+- Outlook `INCLUDE_HIDDEN = True` — also export hidden system folders.
+- Outlook `DEFAULT_SKIP_FOLDERS` — folders skipped by the default selection.
+</details>
 
 ---
 
-## 5. Search tools (offline, no install)
+## 4. Static search pages (offline, no install)
 
-These read an export folder once and write a self-contained `search.html` you open
-in a browser. They use only the standard library.
+Each tool reads an export folder and writes a self-contained `search.html`:
 
-### Teams search
-
-macOS/Linux:
 ```bash
-python3 teams_search.py            # default: teams_export → teams_export/search.html
-```
-Windows:
-```powershell
-python teams_search.py
+python3 teams_search.py                # → teams_export/search.html
+python3 outlook_search.py              # → outlook_export/search.html
+python3 combined_search.py             # → both in one page
 ```
 
-### Outlook search
-
-macOS/Linux:
-```bash
-python3 outlook_search.py          # default: outlook_export → outlook_export/search.html
-```
-Windows:
-```powershell
-python outlook_search.py
-```
-
-### Combined search (Teams + Outlook in one page)
-
-macOS/Linux:
-```bash
-python3 combined_search.py [teams-folder] [outlook-folder] [-o output.html]
-```
-Windows:
-```powershell
-python combined_search.py [teams-folder] [outlook-folder] [-o output.html]
-```
-
-Defaults are `teams_export` and `outlook_export`. The page is written to the common
-parent folder of both exports so the relative links work — don't move it relative to
-the export folders afterwards.
+`combined_search.py` accepts custom folders (`[teams] [outlook] [-o out.html]`)
+and writes the page to the common parent folder of both exports — don't move it
+afterwards, the links are relative.
 
 ---
 
-## 6. RAG Search (optional, AI answers)
+## 5. Search index (needed for MCP and RAG UI)
 
-Requires [Ollama](https://ollama.com) running locally.
+The index lives in `rag_store/`: `corpus.db` (SQLite with an FTS5 full-text
+index) and `vectors.npy` (float16 embeddings, built with
+[Ollama](https://ollama.com)).
 
 ```bash
-ollama pull bge-m3                    # embeddings, multilingual (DE/EN)
-ollama pull qwen2.5:14b-instruct      # answer model, fits well in 24 GB
+ollama pull bge-m3                     # embedding model, multilingual (DE/EN)
+python3 rag_index.py teams_export outlook_export
 ```
 
-Install the extra dependencies (in your virtual environment):
+The build is **incremental** — re-run it after each export; only new/changed
+content is re-embedded.
 
-macOS/Linux:
+---
+
+## 6. MCP server — search with Claude
+
+`mcp_server.py` exposes the exports to Claude (Claude Code / Claude Desktop) as
+[MCP](https://modelcontextprotocol.io) tools — Claude searches, reads sources
+and answers with citations; no local answer model needed.
+
+**Ranking** is hybrid by default: FTS5/BM25 and semantic cosine search merged
+with Reciprocal Rank Fusion — exact tokens (invoice numbers, names) and
+paraphrases both hit. If Ollama is down (or `numpy` is missing) it falls back
+to pure BM25 automatically.
+
+**Run it** (leave it running; one instance serves all Claude sessions):
+
 ```bash
-python3 -m pip install numpy requests
-```
-Windows:
-```powershell
-python -m pip install numpy requests
+python3 mcp_server.py                  # endpoint: http://127.0.0.1:8365/mcp
 ```
 
-Then build the index and start the service:
+> ⚠️ The server has **no authentication** and serves your complete mail and
+> chat history. Keep it on `127.0.0.1` (the default) — never bind it to the
+> network with `--host`.
 
-macOS/Linux:
+**Register in Claude Code** — this repo's `.mcp.json` already does it:
+
+```json
+{"mcpServers": {"office365-export": {"type": "http", "url": "http://127.0.0.1:8365/mcp"}}}
+```
+
+**Register in Claude Desktop** — `claude_desktop_config.json` only accepts
+`command` entries, so bridge the HTTP endpoint with
+[mcp-proxy](https://github.com/sparfenyuk/mcp-proxy):
+
+```json
+{"mcpServers": {"office365-export": {
+  "command": "uvx",
+  "args": ["mcp-proxy", "--transport", "streamablehttp", "http://127.0.0.1:8365/mcp"]
+}}}
+```
+
+Prefer the classic auto-launched setup instead of a shared server? Register a
+`command`-based entry running `python3 mcp_server.py --transport stdio`.
+
+**Tools:** `search_messages` (hybrid search; person/date/source filters,
+pagination), `browse_messages` (filtered listing, newest first), `get_document`
+(full message, optionally with neighboring chat messages), `list_people`
+(who is in the corpus — valid `person` filter values), `read_source_file`
+(raw `.eml`/conversation, windowed for large files), `corpus_stats`. Every hit
+carries an `o365://` resource URI through which Claude can fetch the source
+file. All tools are read-only.
+
+Then just ask Claude: *"Search my Teams chats with Anna about the Q3 budget."*
+
+---
+
+## 7. RAG web UI — fully offline AI answers
+
+The self-contained alternative to the MCP server: retrieval plus a local answer
+model, no Claude involved.
+
 ```bash
-python3 rag_index.py teams_export outlook_export          # 1) build index (incremental)
-python3 rag_server.py --teams teams_export --outlook outlook_export   # 2) serve
-```
-Windows:
-```powershell
-python rag_index.py teams_export outlook_export
-python rag_server.py --teams teams_export --outlook outlook_export
+ollama pull qwen2.5:14b-instruct       # answer model, fits well in 24 GB
+python3 rag_server.py --teams teams_export --outlook outlook_export
 ```
 
-Then open <http://localhost:8000>.
+Then open <http://localhost:8000> — semantic search with filters, or full
+question answering with source citations.

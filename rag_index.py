@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-rag_index.py – baut den Embedding-Index für die lokale RAG-Suche.
+rag_index.py – baut den Index für die lokale RAG-Suche und den MCP-Server.
 
 Liest beide Exporte (über corpus.py), bettet jeden Chunk per Ollama ein und legt
-Vektoren + Metadaten in einem Store-Ordner ab. Inkrementell: bei erneutem Lauf
-werden nur neue/geänderte Chunks neu berechnet (Abgleich über Inhalts-Hash).
+alles in einem Store-Ordner ab:
+
+    corpus.db     SQLite: Chunks + Metadaten, FTS5-Volltextindex (BM25),
+                  vorberechnete Personenliste. Wird von mcp_server.py und
+                  rag_server.py abfragbar genutzt – kein Laden in den RAM nötig.
+    vectors.npy   Embedding-Matrix, float16 (halber Platz, praktisch gleiche
+                  Kosinus-Rangfolge). Zeile i gehört zu chunks.id = i+1.
+    info.json     Modell/Dimension/Format.
+
+Inkrementell: bei erneutem Lauf werden nur neue/geänderte Chunks neu berechnet
+(Abgleich über Inhalts-Hash), vorhandene Vektoren werden wiederverwendet.
 
     ollama serve                 # Ollama muss laufen
     ollama pull bge-m3           # mehrsprachiges Embedding-Modell (DE/EN)
@@ -16,12 +25,12 @@ Optionen: --model bge-m3  --ollama http://localhost:11434  --batch 64
 
 import sys
 import json
+import sqlite3
 import argparse
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
-import requests
 
 import corpus
 
@@ -37,9 +46,12 @@ for _stream in (sys.stdout, sys.stderr):
 
 DEFAULT_MODEL = "bge-m3"
 DEFAULT_OLLAMA = "http://localhost:11434"
+FORMAT = 2                     # 2 = corpus.db + float16-Vektoren
+PPL_TOKEN_CAP = 60             # Personen-Tokens pro Person in der people-Tabelle
 
 
 def embed(texts, model, url, timeout=600):
+    import requests
     try:
         r = requests.post(f"{url}/api/embed",
                           json={"model": model, "input": texts}, timeout=timeout)
@@ -58,18 +70,120 @@ def embed(texts, model, url, timeout=600):
     return embs
 
 
+# --------------------------------------------------------------------------
+# SQLite-Store schreiben
+# --------------------------------------------------------------------------
+def _chunk_row(i, c):
+    seq = int(c["cid"].rsplit("#", 1)[1])
+    try:
+        msg_idx = int(c["uid"].rsplit(":", 1)[1])
+    except ValueError:
+        msg_idx = 0
+    return (i + 1, c["uid"], seq, msg_idx, c["src"], c["root"], c["rel"],
+            c.get("who"), c.get("ppl"), c.get("ts"), c.get("date"),
+            c.get("title"), c.get("ctx"), c.get("text"), c.get("hash"))
+
+
+def _people_rows(chunks):
+    """(src, who) → Nachrichtenzahl + Personen-Token für die contains-Suche."""
+    agg = {}
+    for c in chunks:
+        if not c["cid"].endswith("#0"):           # eine Nachricht nur einmal zählen
+            continue
+        key = (c["src"], (c.get("who") or "").strip())
+        cnt, toks = agg.setdefault(key, [0, set()])
+        agg[key][0] = cnt + 1
+        if len(toks) < PPL_TOKEN_CAP:
+            toks.update((c.get("ppl") or "").split()[:PPL_TOKEN_CAP])
+    return [(src, who, cnt, " ".join(sorted(toks)))
+            for (src, who), (cnt, toks) in agg.items()]
+
+
+def write_db(store, chunks):
+    """corpus.db atomisch neu schreiben (erst .tmp, dann ersetzen)."""
+    dbp = Path(store) / "corpus.db"
+    tmp = dbp.with_name("corpus.db.tmp")
+    tmp.unlink(missing_ok=True)
+    con = sqlite3.connect(tmp)
+    con.executescript("""
+        PRAGMA journal_mode = OFF;
+        PRAGMA synchronous = OFF;
+        CREATE TABLE chunks(
+            id      INTEGER PRIMARY KEY,   -- Vektorzeile = id - 1
+            uid     TEXT NOT NULL,         -- Nachricht (mehrere Chunks möglich)
+            seq     INTEGER NOT NULL,      -- Chunk-Nr. innerhalb der Nachricht
+            msg_idx INTEGER NOT NULL,      -- Nachrichten-Nr. innerhalb der Datei
+            src     TEXT NOT NULL, root TEXT NOT NULL, rel TEXT NOT NULL,
+            who TEXT, ppl TEXT, ts REAL, date TEXT,
+            title TEXT, ctx TEXT, text TEXT, hash TEXT);
+        CREATE INDEX ix_chunks_uid ON chunks(uid);
+        CREATE INDEX ix_chunks_src_ts ON chunks(src, ts);
+        CREATE INDEX ix_chunks_file ON chunks(root, rel, msg_idx);
+        CREATE TABLE people(src TEXT, who TEXT, messages INTEGER, ppl TEXT);
+        CREATE INDEX ix_people_who ON people(who);
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            title, text, content='chunks', content_rowid='id');
+    """)
+    con.executemany("INSERT INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (_chunk_row(i, c) for i, c in enumerate(chunks)))
+    con.executemany("INSERT INTO people VALUES (?,?,?,?)", _people_rows(chunks))
+    con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+    con.commit()
+    con.close()
+    tmp.replace(dbp)
+
+
+def save_vectors(store, V):
+    """Normalisiert als float16 speichern (halber Platz, Rangfolge ~identisch)."""
+    V = V.astype("float32")
+    norms = np.linalg.norm(V, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    V = (V / norms).astype("float16")
+    tmp = Path(store) / "vectors.npy.tmp"
+    with open(tmp, "wb") as f:                 # Dateiobjekt: np.save hängt kein .npy an
+        np.save(f, V)
+    tmp.replace(Path(store) / "vectors.npy")
+    return V
+
+
+def write_info(store, model, dim, n):
+    (Path(store) / "info.json").write_text(json.dumps({
+        "model": model, "dim": int(dim), "chunks": int(n),
+        "dtype": "float16", "format": FORMAT,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# --------------------------------------------------------------------------
+# Alten Store lesen (für inkrementelle Läufe)
+# --------------------------------------------------------------------------
+def _load_old_store(store):
+    """(hashes_in_order, V) des vorhandenen Stores."""
+    sp = Path(store)
+    vp = sp / "vectors.npy"
+    V = np.load(vp) if vp.exists() else None
+    dbp = sp / "corpus.db"
+    if dbp.exists():
+        con = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True)
+        hashes = [r[0] for r in con.execute("SELECT hash FROM chunks ORDER BY id")]
+        con.close()
+        return hashes, V
+    return [], V
+
+
 def load_old_vectors(store):
-    mp, vp = Path(store) / "meta.json", Path(store) / "vectors.npy"
-    if mp.exists() and vp.exists():
-        try:
-            meta = json.loads(mp.read_text(encoding="utf-8"))
-            V = np.load(vp)
-            return {c["hash"]: V[i] for i, c in enumerate(meta) if i < len(V)}
-        except Exception:
-            print("  Alter Index unlesbar – baue komplett neu.")
-    return {}
+    try:
+        hashes, V = _load_old_store(store)
+        if V is None or not hashes:
+            return {}
+        return {h: V[i] for i, h in enumerate(hashes) if h and i < len(V)}
+    except Exception:
+        print("  Alter Index unlesbar – baue komplett neu.")
+        return {}
 
 
+# --------------------------------------------------------------------------
+# Index bauen
+# --------------------------------------------------------------------------
 def build_index(teams_dir, outlook_dir, store, model, url, batch=64):
     recs = corpus.load_records(teams_dir, outlook_dir)
     chunks = corpus.chunk_records(recs)
@@ -117,18 +231,10 @@ def build_index(teams_dir, outlook_dir, store, model, url, batch=64):
                 print(f"  … {done}/{len(todo_texts)} eingebettet", end="\r", flush=True)
         print()
 
-    V = np.vstack(vectors).astype("float32")
-    norms = np.linalg.norm(V, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    V = V / norms
-
-    sp = Path(store)
-    sp.mkdir(parents=True, exist_ok=True)
-    np.save(sp / "vectors.npy", V)
-    (sp / "meta.json").write_text(json.dumps(chunks, ensure_ascii=False), encoding="utf-8")
-    (sp / "info.json").write_text(json.dumps({
-        "model": model, "dim": int(V.shape[1]), "chunks": len(chunks),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    Path(store).mkdir(parents=True, exist_ok=True)
+    V = save_vectors(store, np.vstack(vectors))
+    write_db(store, chunks)
+    write_info(store, model, V.shape[1], len(chunks))
     return len(chunks), new_total, int(V.shape[1])
 
 
@@ -145,7 +251,7 @@ def main():
     print(f"Index → {a.store}  (Modell {a.model})")
     n, new, dim = build_index(a.teams, a.outlook, a.store, a.model, a.ollama, a.batch)
     print(f"\nFertig. {n} Chunks im Index ({dim} Dimensionen), davon {new} neu berechnet.")
-    print(f"Jetzt: python3 rag_server.py --store {a.store}")
+    print(f"Jetzt: python3 rag_server.py --store {a.store}  oder  mcp_server.py")
 
 
 if __name__ == "__main__":
