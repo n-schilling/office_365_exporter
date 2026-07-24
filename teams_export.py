@@ -235,7 +235,7 @@ class Graph:
                     r = SESSION.get(url, headers=self._headers(), timeout=60)
             except requests.exceptions.RequestException as e:
                 if attempt == 3:
-                    raise ImageUnavailable(type(e).__name__)
+                    raise ImageUnavailable(type(e).__name__) from e
                 w = min(2 ** attempt, 30)
                 print(f"    … Netzwerkfehler (Bild, {type(e).__name__}), warte {w}s")
                 time.sleep(w)
@@ -327,7 +327,7 @@ class TokenClient:
                     r = SESSION.get(url, headers=self._headers(), timeout=60)
             except requests.exceptions.RequestException as e:
                 if attempt == 3:
-                    raise ImageUnavailable(type(e).__name__)
+                    raise ImageUnavailable(type(e).__name__) from e
                 w = min(2 ** attempt, 30)
                 print(f"    … Netzwerkfehler (Bild, {type(e).__name__}), warte {w}s")
                 time.sleep(w)
