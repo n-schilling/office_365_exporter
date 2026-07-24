@@ -205,8 +205,16 @@ class Graph:
 
     def get(self, url, params=None):
         for attempt in range(6):
-            with GATE:   # nur das eigentliche Request zählt gegen das Limit
-                r = SESSION.get(url, headers=self._headers(), params=params, timeout=60)
+            try:
+                with GATE:   # nur das eigentliche Request zählt gegen das Limit
+                    r = SESSION.get(url, headers=self._headers(), params=params, timeout=60)
+            except requests.exceptions.RequestException as e:
+                if attempt == 5:
+                    raise
+                w = min(2 ** attempt, 60)
+                print(f"    … Netzwerkfehler ({type(e).__name__}), warte {w}s")
+                time.sleep(w)
+                continue
             if r.status_code == 401:
                 self._refresh()
                 continue
@@ -222,8 +230,16 @@ class Graph:
 
     def get_bytes(self, url):
         for attempt in range(4):
-            with GATE:
-                r = SESSION.get(url, headers=self._headers(), timeout=60)
+            try:
+                with GATE:
+                    r = SESSION.get(url, headers=self._headers(), timeout=60)
+            except requests.exceptions.RequestException as e:
+                if attempt == 3:
+                    raise ImageUnavailable(type(e).__name__)
+                w = min(2 ** attempt, 30)
+                print(f"    … Netzwerkfehler (Bild, {type(e).__name__}), warte {w}s")
+                time.sleep(w)
+                continue
             if r.status_code == 401:
                 self._refresh()
                 continue
@@ -282,8 +298,16 @@ class TokenClient:
 
     def get(self, url, params=None):
         for attempt in range(6):
-            with GATE:
-                r = SESSION.get(url, headers=self._headers(), params=params, timeout=60)
+            try:
+                with GATE:
+                    r = SESSION.get(url, headers=self._headers(), params=params, timeout=60)
+            except requests.exceptions.RequestException as e:
+                if attempt == 5:
+                    raise
+                w = min(2 ** attempt, 60)
+                print(f"    … Netzwerkfehler ({type(e).__name__}), warte {w}s")
+                time.sleep(w)
+                continue
             if r.status_code == 401:
                 self._expired()
             if r.status_code == 429 or 500 <= r.status_code < 600:
@@ -298,8 +322,16 @@ class TokenClient:
 
     def get_bytes(self, url):
         for attempt in range(4):
-            with GATE:
-                r = SESSION.get(url, headers=self._headers(), timeout=60)
+            try:
+                with GATE:
+                    r = SESSION.get(url, headers=self._headers(), timeout=60)
+            except requests.exceptions.RequestException as e:
+                if attempt == 3:
+                    raise ImageUnavailable(type(e).__name__)
+                w = min(2 ** attempt, 30)
+                print(f"    … Netzwerkfehler (Bild, {type(e).__name__}), warte {w}s")
+                time.sleep(w)
+                continue
             if r.status_code == 401:
                 self._expired()
             if r.status_code == 429:          # echte Drosselung -> abwarten
